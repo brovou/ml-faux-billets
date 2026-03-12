@@ -1,0 +1,1061 @@
+---
+title: "ONCFM - Détection de faux billets"
+author: "Senior Data Analyst"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+
+# Paramètres globaux pour les chunks R dans un document R Markdown
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+
+library(tidyverse)        # tidyverse : ensemble de packages pour manipulation, visualisation et pipelines (%>%)
+library(janitor)          # janitor : nettoyage des noms de colonnes, gestion des tableaux
+library(naniar)           # naniar : outils pour visualiser et analyser les valeurs manquantes
+library(corrplot)         # corrplot : visualisation des matrices de corrélation
+library(ggpubr)           # ggpubr : fonctions pratiques pour améliorer les graphiques ggplot
+library(dplyr)            # dplyr : manipulation de données (inclus dans tidyverse mais parfois chargé séparément)
+library(readr)            # readr : lecture rapide et propre des fichiers CSV
+library(stringr)          # stringr : manipulation avancée des chaînes de caractères
+library(ggplot2)          # ggplot2 : création de graphiques (inclus dans tidyverse mais souvent chargé explicitement)
+library(tidyr)            # tidyr : transformation des données (pivot_longer, pivot_wider, etc.)
+library(caret)            # caret : framework complet pour l’entraînement et l’évaluation de modèles ML
+library(GGally)           # GGally : extensions de ggplot2, notamment ggpairs pour explorer les relations entre variables
+library(pROC)             # pROC : calcul et tracé des courbes ROC + AUC
+library(randomForest)     # randomForest : algorithme Random Forest (classification et régression)
+library(cluster)          # cluster : package spécialisé dans les méthodes de clustering
+library(broom)
+library(pscl)  
+library(randomForest)
+library(factoextra)
+
+# Définir le répertoire racine (root.dir) pour knitr
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+
+```
+
+
+```{r PARTIE 1 — EXPLORATION DES DONNÉES }
+# Paramètres colonnes 
+y_col <- "is_genuine"
+x_cols <- c("diagonal", "height_left", "height_right", "margin_low", "margin_up", "length")
+
+# Chargement des données
+df_raw <- read.csv2("D:/Formations/Data Analyst/Projet 12/data/raw/billets.csv",
+                    stringsAsFactors = FALSE) %>%
+  janitor::clean_names()
+
+# Vérifier colonnes attendues
+missing_cols <- setdiff(c(y_col, x_cols), names(df_raw))
+if (length(missing_cols) > 0) {
+  stop(paste("Colonnes manquantes :", paste(missing_cols, collapse = ", ")))
+}
+
+# Conserver uniquement les colonnes utiles
+df <- df_raw %>%
+  select(all_of(c(y_col, x_cols)))
+
+# Harmoniser la cible en VRAI/FAUX
+df <- df_raw %>%
+  mutate(
+    is_genuine = str_trim(as.character(is_genuine)),
+    is_genuine = case_when(
+      is_genuine %in% c("1","TRUE","True","true","VRAI","vrai","genuine") ~ "VRAI",
+      is_genuine %in% c("0","FALSE","False","false","FAUX","faux","fake") ~ "FAUX",
+      TRUE ~ NA_character_
+    ),
+    is_genuine = factor(is_genuine, levels = c("VRAI","FAUX"))
+  ) %>%
+  mutate(
+    # Convertir les X en numériques
+    across(all_of(x_cols), ~parse_number(as.character(.x)))
+  )
+
+# Vérification
+table(df$is_genuine, useNA = "ifany")
+
+```
+## Interprétation
+Les variables X sont maintenant correctement en numérique (double), donc les stats descriptives sont fiables.
+
+
+```{r Description du dataset}
+cat("Dimensions (lignes, colonnes) :", nrow(df), ncol(df), "\n")
+glimpse(df)
+
+# Répartition de la cible
+df %>%
+  count(is_genuine) %>%
+  mutate(pct = round(100 * n / sum(n), 2))
+
+# Valeurs manquantes (taux)
+df %>%
+  summarise(across(all_of(c(y_col, x_cols)), ~round(100 * mean(is.na(.)), 2))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "na_rate_pct") %>%
+  arrange(desc(na_rate_pct))
+
+# Visual NA (option)
+gg_miss_var(df) + labs(title = "Valeurs manquantes par variable")
+
+# Doublons (lignes identiques)
+sum(duplicated(df))
+```
+
+## Interprétations
+
+Qualité globale très bonne : dataset exploitable sans gros nettoyage.Point d’attention : margin_low est manquante sur 37 billets.
+
+
+```{r Tableau récap (type + NA + min/max)}
+dico <- tibble(
+  variable = c(y_col, x_cols),
+  type = map_chr(df[c(y_col, x_cols)], ~class(.x)[1]),
+  na_count = map_int(df[c(y_col, x_cols)], ~sum(is.na(.x))),
+  na_rate_pct = round(100 * na_count / nrow(df), 2)
+) %>%
+  left_join(
+    map_dfr(x_cols, ~tibble(
+      variable = .x,
+      min = min(df[[.x]], na.rm = TRUE),
+      max = max(df[[.x]], na.rm = TRUE),
+      mean = mean(df[[.x]], na.rm = TRUE),
+      median = median(df[[.x]], na.rm = TRUE),
+      sd = sd(df[[.x]], na.rm = TRUE)
+    )),
+    by = "variable"
+  )
+dico
+```
+## Interprétations
+Variables très “stables” (faible dispersion) : diagonal : sd ≈ 0,305 - height_left : sd ≈ 0,299 - height_right : sd ≈ 0,326 - margin_up : sd ≈ 0,232
+Ce sont des mesures physiques peu variables (normal : billets sont standardisés). Elles peuvent aider, mais leur pouvoir discriminant peut être plus faible que des variables plus contrastées.
+
+Variables plus dispersées (donc potentiellement plus discriminantes) : margin_low : sd ≈ 0,664 - length : sd ≈ 0,873
+Ces variables varient davantage → elles peuvent capturer une différence structurelle entre VRAI et FAUX. 
+
+```{r Description graphique des variables (univariée)}
+df_long <- df %>%
+  pivot_longer(all_of(x_cols), names_to = "variable", values_to = "value")
+
+# Histogrammes (facettés)
+ggplot(df_long, aes(x = value)) +
+  geom_histogram(bins = 30, alpha = 0.6) +
+  facet_wrap(~variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distributions des variables (histogrammes)")
+```
+## Interpretations
+-diagonal : variable stable, cohérente avec une mesure “standard” du billet. Elle peut contribuer au modèle, mais seule elle ne semble pas fortement discriminante (faible variabilité).
+
+-height_left : mesure très stable et “bien contrôlée”. Peu de valeurs extrêmes visibles. Bon indicateur de qualité, mais probablement moins discriminant que des variables plus dispersées.
+
+-height_right : même lecture que height_left. Le couple height_left / height_right peut être redondant (à confirmer par corrélation), mais utile pour capter des asymétries fines.
+
+-length : la multimodalité suggère un mélange de sous-populations, très probablement lié aux classes (VRAI vs FAUX). C’est un signal fort : length est candidate à être très discriminante (ce que confirme votre classement par diff_median).
+
+-margin_low : variable très informative potentiellement : l’asymétrie + la dispersion la rendent apte à séparer des groupes. C’est cohérent avec l’idée métier : des faux billets peuvent présenter des marges “anormales”.
+
+-margin_up : mesure assez stable, probablement utile en complément mais moins discriminante seule que length/margin_low.
+
+Les variables diagonal, height_left, height_right et margin_up présentent des distributions unimodales proches d’une loi normale, avec une faible dispersion, ce qui reflète la standardisation des billets. À l’inverse, length montre une structure multimodale et margin_low une asymétrie marquée et une dispersion plus forte, suggérant un mélange de populations et un potentiel discriminant élevé. 
+
+```{r Description graphique des variables (univariée)}
+# Boxplots
+ggplot(df_long, aes(y = value)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free", ncol = 3) +
+  theme_minimal() +
+  labs(title = "Distributions des variables (Boxplots)",
+       x = NULL, y = "Valeur")
+```
+## Interpretations
+-diagonal : mesure globalement stable (billets standardisés). Les outliers sont rares et peuvent venir d’un scan atypique ou d’un billet hors norme.
+
+-height_left : variable très stable, avec quelques mesures extrêmes. Peu de variabilité → probablement moins discriminante seule.
+
+-height_right : même logique que height_left. Le fait d’avoir plusieurs outliers bas peut indiquer des scans “tirés” ou des billets atypiques.
+
+-length : length varie davantage et présente des extrêmes bas. length est un candidat fortement discriminant (les faux billets semblent plus souvent associés à des valeurs plus faibles).
+
+-margin_low : variable très informative potentiellement (variabilité + asymétrie). Les grandes valeurs peuvent correspondre à des anomalies de marge (typique de faux billets).
+
+-margin_up : variable stable. Quelques scans extrêmes existent mais restent rares.
+
+Les boxplots confirment que diagonal, height_left, height_right et margin_up sont des variables très stables (IQR faible) avec peu d’outliers. À l’inverse, length présente une dispersion plus importante et quelques valeurs très basses, tandis que margin_low montre la plus forte variabilité, une asymétrie à droite et de nombreux outliers élevés. Ces éléments suggèrent que length et surtout margin_low sont les variables les plus susceptibles de discriminer les billets vrais et faux,
+
+```{r Description des relations entre variables}
+# Matrice de corrélation (X ↔ X)
+cor_mat <- cor(df %>% select(all_of(x_cols)),
+               use = "pairwise.complete.obs",
+               method = "pearson")
+
+corrplot(cor_mat, method = "color", type = "upper", tl.cex = 0.9)
+```
+
+## Interpretation
+Relations les plus marquantes
+- margin_low ↔ length : forte corrélation négative -> ces deux variables capturent un “profil géométrique” opposé entre billets,    ce qui explique pourquoi elles sont très discriminantes.
+- height_left ↔ height_right : corrélation positive assez forte -> variables potentiellement redondantes (colinéarité partielle).
+- margin_low ↔ margin_up : corrélation positive modérée
+
+Relations secondaires
+- margin_up ↔ length : corrélation négative modérée
+- height_left/right et margin_low/up : corrélations positives faibles à modérées
+- diagonal : corrélations globalement faibles
+
+
+```{r Distribution croisée (Y ↔ X) : résumés par classe}
+# Tableau : moyenne/médiane par classe pour chaque variable
+cross_summary <- df %>%
+  group_by(is_genuine) %>%
+  summarise(
+    across(all_of(x_cols),
+           list(mean = ~mean(.x, na.rm = TRUE),
+                median = ~median(.x, na.rm = TRUE),
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}"),
+    .groups = "drop"
+  )
+cross_summary
+```
+
+## Interprétation
+- Les variables diagonal / height_left / height_right / margin_up sont souvent peu discriminantes seules car leursmoyennes/médianes sont proches entre VRAI et FAUX.
+- Les variables qui discriminent le plus sont généralement celles où : la médiane VRAI et la médiane FAUX sont nettement différentes, et/ou la dispersion est très différente.
+
+```{r Comparaison des distributions VRAI/FAUX (variable par variable)}
+# Boxplots par classe (demandé)
+for (v in x_cols) {
+  p <- ggplot(df, aes(x = is_genuine, y = .data[[v]])) +
+    geom_boxplot() +
+    labs(title = paste("Comparaison VRAI vs FAUX :", v),
+         x = "Classe (is_genuine)", y = v) +
+    theme_minimal()
+  print(p)
+}
+```
+## Interpretations
+- diagonal — très faible discrimination -> apporte peu d’information pour séparer VRAI/FAUX (variable “stable”, plutôt contrôle qualité).
+- height_left — discrimination faible à modérée -> variable utile en complément, mais pas suffisante seule.
+- height_right — discrimination modérée -> contribue davantage que height_left, mais reste secondaire par rapport à length/margin_low.
+- margin_low — très forte discrimination -> l’une des meilleures variables pour détecter les faux billets (cohérent avec votre règle empirique : VRAI < 5).
+- margin_up — discrimination modérée -> variable utile (secondaire), peut améliorer un modèle multivarié.
+- length — très forte discrimination -> la variable la plus discriminante (cohérent avec la règle empirique : VRAI > 112).
+
+```{r Classement simple des variables les plus discriminantes}
+# Différence de médiane VRAI vs FAUX
+eda_discriminant <- map_dfr(x_cols, function(v) {
+  med <- df %>%
+    group_by(is_genuine) %>%
+    summarise(med = median(.data[[v]], na.rm = TRUE), .groups = "drop")
+  tibble(
+    variable = v,
+    median_vrai = med$med[med$is_genuine == "VRAI"],
+    median_faux = med$med[med$is_genuine == "FAUX"],
+    diff_median = abs(median_vrai - median_faux)
+  )
+}) %>% arrange(desc(diff_median))
+
+eda_discriminant
+```
+
+## Interpretation
+- length — diff_median = 1.58 (très discriminant) : Les vrais billets sont plus longs en médiane que les faux. C’est la variable la plus informative, cohérente avec votre règle empirique length > 112.
+- margin_low — diff_median = 1.08 (très discriminant) : Les faux billets ont une marge basse plus élevée en médiane. Cela valide  l’autre partie de la règle empirique margin_low < 5 pour un vrai billet.
+- height_right — diff_median = 0.35 (discrimination modérée) : Peut apporter un gain en combinaison, mais moins déterminant que length et margin_low.
+- margin_up — diff_median = 0.30 (modéré) : Signal existant mais plus faible : utile comme variable secondaire.
+- height_left — diff_median = 0.23 (faible) : Faible capacité de séparation seule, mais peut aider légèrement en modèle multivarié.
+- diagonal — diff_median = 0.08 (très faible) : Très peu discriminante : les médianes sont presque identiques entre classes. Variable plutôt “contrôle de conformité” que variable clé pour séparer.
+- Le classement par écart de médiane montre que les variables les plus discriminantes sont length (diff=1.58) et margin_low (diff=1.08). Elles portent l’essentiel du signal de séparation entre vrais et faux billets et justifient la règle empirique initiale (length > 112 et margin_low < 5). Les autres variables (height_right, margin_up, height_left) contribuent de façon secondaire, tandis que diagonal est quasi non discriminante.
+
+```{r Standardisation des variables numériques (z-score)}
+df <- df %>%
+  mutate(across(all_of(x_cols),
+                ~ as.numeric(scale(.x)),
+                .names = "{.col}_z"))
+```
+
+
+```{r Scatterplot entre deux variables standardisées}
+# Visualisation de la relation entre margin_low et length
+ggplot(df, aes(x = margin_low_z, y = length_z, color = is_genuine)) +
+  geom_point(alpha = 0.6) +
+  theme_minimal() +
+  labs(
+    title = "Scatterplot : margin_low vs length",
+    x = "margin_low (z-score)",
+    y = "length (z-score)",
+    color = "Classe"
+  )
+```
+## Interpretation
+- VRAI (rose) : plutôt à gauche et en haut -> margin_low plus faible (z < 0 en majorité) et length plus élevée (z > 0 en majorité)
+- FAUX (bleu) : plutôt à droite et en bas -> margin_low plus élevée (z > 0 en majorité) et length plus faible (z < 0 en majorité)
+-> Le couple (margin_low, length) discrimine fortement les billets.
+
+```{r Pairplot}
+# Vérification de la distribution des classes
+table(df$is_genuine, useNA = "ifany")
+
+# Corrélation entre deux variables standardisées
+cor(df$margin_low_z, df$length_z, use = "complete.obs")
+
+# Préparation des données pour le pairplot
+df_plot <- df %>%
+  mutate(is_genuine = factor(is_genuine))
+
+# Visualisation des relations deux à deux entre toutes les variables
+ggpairs(
+  df_plot,
+  columns = x_cols,
+  aes(color = is_genuine, alpha = 0.6),
+  diag = list(continuous = wrap("densityDiag", alpha = 0.4)),
+  upper = list(continuous = wrap("points", size = 0.8)),
+  lower = list(continuous = wrap("points", size = 0.8))
+) +
+  labs(title = "Pairplot : relations deux a deux (colore par is_genuine)")
+```
+## Interpretation
+La diagonale compare directement les distributions VRAI vs FAUX : 
+- length : séparation très nette - Variable très discriminante.
+- margin_low : séparation très nette - Variable très discriminante.
+- margin_up : décalage visible mais chevauchement - Discriminante secondaire.
+- height_left et height_right : décalage léger/modéré, overlap important - Discriminantes secondaires.
+- diagonal : densités quasi superposées - Discrimination faible.
+
+Séparation la plus convaincante : margin_low vs length
+- On voit deux nuages bien distincts. C’est le “couple” qui explique le mieux la classe.
+
+Corrélation forte entre variables “proches”
+- height_left vs height_right : relation positive visible (nuage allongé) et indique une redondance / colinéarité partielle
+
+Relation inverse margin_low ↔ length
+- quand margin_low augmente, length diminue. Donc cohérent avec la corrélation négative observée.
+
+diagonal apporte peu -> faible contribution discriminante isolée.
+
+```{r PARTIE 2 — MODÉLISATION (4 algorithmes) | ONCFM}
+set.seed(42)
+
+# Vérifier types + cible
+stopifnot(all(c(y_col, x_cols) %in% names(df)))
+
+# Assurer numérique sur X
+df <- df %>%
+  mutate(across(all_of(x_cols), ~as.numeric(.x)))
+
+# Assurer facteur sur Y
+df <- df %>%
+  mutate(is_genuine = factor(is_genuine, levels = c("VRAI","FAUX")))
+
+# Gérer les NA (ici on retire les lignes NA pour démarrer proprement)
+df_model <- df %>% drop_na(all_of(c(y_col, x_cols)))
+```
+
+## Justification de la suppression des valeurs manquantes
+Avec moins de 3% de lignes concernées, l’impact sur la puissance statistique est marginal. La suppression évite de ‘fabriquer’ des valeurs (ex : moyenne/médiane) qui pourraient lisser le signal discriminant, surtout sur une variable fortement informative (margin_low).
+
+```{r Phase 1 — Split TRAIN/TEST (80/20) stratifié}
+# Création des index pour séparer les données
+idx_train <- createDataPartition(df_model[[y_col]], p = 0.80, list = FALSE)
+
+# Création du jeu d'entraînement
+train_df <- df_model[idx_train, ]
+
+# Création du jeu de test
+test_df  <- df_model[-idx_train, ]
+
+# Vérifier tailles
+nrow(train_df); nrow(test_df)
+
+# Vérifier stratification (ratios proches)
+prop.table(table(train_df[[y_col]]))
+prop.table(table(test_df[[y_col]]))
+```
+
+
+```{r Fonctions utilitaires (métriques + matrice confusion)}
+# Préparation des vecteurs de vérité et de prédiction pour la matrice de confusion
+#eval_model <- function(y_true, y_pred, positive_class = "FAUX") {
+ # y_true <- factor(y_true, levels = c("VRAI","FAUX"))
+#  y_pred <- factor(y_pred, levels = c("VRAI","FAUX"))
+  
+# Calcule les métriques de classification (accuracy, précision, rappel, F1)
+#cm <- confusionMatrix(y_pred, y_true, positive = positive_class)
+
+#Extraction des métriques depuis la matrice de confusion
+#acc <- as.numeric(cm$overall["Accuracy"])               # Accuracy : proportion totale de bonnes prédictions
+#prec <- as.numeric(cm$byClass["Precision"])             # Precision : parmi les billets prédits FAUX, combien sont réellement FAUX
+#rec  <- as.numeric(cm$byClass["Recall"])                # Recall : parmi les vrais FAUX, combien le modèle détecte correctement
+#f1   <- as.numeric(cm$byClass["F1"])                    # F1-score : moyenne harmonique entre précision et rappel
+
+# Mise en forme des résultats dans une liste
+#list(confusion = cm$table,                               # tableau VRAI/FAUX
+   #   accuracy = acc,                                    # exactitude globale
+    #  precision_faux = prec,                             # précision pour la classe FAUX
+     # recall_faux = rec,                                 # rappel pour la classe FAUX
+    #  f1_faux = f1)                                      # F1-score pour la classe FAUX
+#}
+
+eval_model <- function(y_true, y_pred, positive_class = "FAUX") {
+  # 1) niveaux stricts et identiques
+  lvls <- c("VRAI", "FAUX")
+  y_true <- factor(y_true, levels = lvls)
+  y_pred <- factor(y_pred, levels = lvls)
+
+  # 2) confusionMatrix (rows = Prediction, cols = Reference)
+  cm <- confusionMatrix(data = y_pred, reference = y_true, positive = positive_class)
+
+  # 3) extraction des cellules (robuste)
+  tab <- cm$table
+  TP <- tab[positive_class, positive_class]
+  FP <- sum(tab[positive_class, ]) - TP
+  FN <- sum(tab[, positive_class]) - TP
+  TN <- sum(tab) - TP - FP - FN
+
+  # 4) métriques calculées à partir de la matrice (cohérentes à 100%)
+  accuracy  <- (TP + TN) / (TP + TN + FP + FN)
+  precision <- ifelse((TP + FP) == 0, NA, TP / (TP + FP))
+  recall    <- ifelse((TP + FN) == 0, NA, TP / (TP + FN))
+  f1        <- ifelse(is.na(precision) | is.na(recall) | (precision + recall) == 0,
+                      NA, 2 * precision * recall / (precision + recall))
+
+  list(
+    confusion = tab,
+    accuracy = as.numeric(accuracy),
+    precision_faux = as.numeric(precision),
+    recall_faux = as.numeric(recall),
+    f1_faux = as.numeric(f1),
+
+    # bonus debug (utile soutenance)
+    TP = as.numeric(TP), FP = as.numeric(FP), FN = as.numeric(FN), TN = as.numeric(TN),
+    caret_byClass = cm$byClass
+  )
+}
+
+# Extrait la probabilité que le billet soit FAUX
+get_prob_faux <- function(fit, newdata, positive = "FAUX") {
+    p <- predict(fit, newdata = newdata, type = "prob")
+    p[[positive]]
+  }  
+
+#  Calcule l’AUC (Area Under the Curve) à partir des probabilités
+eval_auc <- function(y_true, prob_faux) {
+  y_true <- factor(y_true, levels = c("VRAI","FAUX"))
+  roc_obj <- roc(response = y_true,
+                 predictor = prob_faux,
+                 levels = c("VRAI","FAUX"),
+                 direction = "<",
+                 quiet = TRUE)
+  list(auc = as.numeric(auc(roc_obj)), roc = roc_obj)
+}
+
+# Paramètres de validation croisée pour l'entraînement des modèles
+ctrl <- trainControl(
+  method = "cv",                # validation croisée
+  number = 5,                   # 5 folds (découpage en 5 sous-ensembles)
+  classProbs = TRUE,            # permet d'obtenir les probabilités (utile pour AUC)
+  savePredictions = "final"     # garde les prédictions finales pour analyse
+)
+```
+## Interprétation des métriques (priorité ONCFM)
+
+L'objectif opérationnel est de **maximiser la détection des faux billets**.
+
+- **Sensibilité / Recall (FAUX)** : proportion de faux billets correctement détectés.  
+  → C’est l’indicateur prioritaire car un **FN** (faux classé vrai) représente un risque majeur.
+- **Spécificité (VRAI)** : proportion de vrais billets correctement reconnus.  
+  → Un **FP** (vrai classé faux) génère surtout un coût de contrôle supplémentaire.
+- **Accuracy** : indicateur global, utile mais moins prioritaire si les classes sont déséquilibrées.
+- **F1-score** : compromis précision/recall.
+
+
+```{r MODÈLE 1 — RÉGRESSION LOGISTIQUE}
+# Helpers
+# Calcule le pseudo R² de McFadden pour évaluer la qualité du modèle
+pseudoR2_mcfadden <- function(m) {
+  ll_full <- as.numeric(logLik(m))                                      # Lg-vraisemblance du modèle complet
+  m0 <- update(m, . ~ 1)                                                # Modèle nul (sans variables explicatives)
+  ll_null <- as.numeric(logLik(m0))                                     # Log-vraisemblance du modèle nul
+  1 - (ll_full / ll_null)                                               # Formule du pseudo R² de McFadden
+}
+
+# Extrait les p-values des coefficients du modèle (hors intercept)
+get_pvalues <- function(m) {
+  coefs <- summary(m)$coefficients                                      # Matrice des coefficients
+  p <- coefs[, "Pr(>|z|)"]                                              # Extraction des p-values
+  p <- p[names(p) != "(Intercept)"]                                     # Suppression de l'intercept
+  p <- as.numeric(p)                                                    # Conversion en vecteur numérique
+  names(p) <- rownames(coefs)[rownames(coefs) != "(Intercept)"]         # Noms des variables
+  return(p)
+}
+
+# Capture un "instantané" du modèle à une étape donnée du backward stepwise
+model_snapshot <- function(m, step_id, removed, train_df) {
+  pvals <- get_pvalues(m)                                                          # Récupère les p-values des variables restantes
+  worst_var <- if (length(pvals) == 0) NA_character_ else names(which.max(pvals))  # Variable la moins significative
+  worst_p   <- if (length(pvals) == 0) NA_real_      else max(pvals)               # Sa p-value
+
+# Informations descriptives sur la variable supprimée (moyenne, sd, min, max)
+  removed_value <- if (!is.na(removed) && removed %in% names(train_df)) {
+    paste0("mean=", round(mean(train_df[[removed]], na.rm=TRUE), 3),
+           " | sd=", round(sd(train_df[[removed]], na.rm=TRUE), 3),
+           " | min=", round(min(train_df[[removed]], na.rm=TRUE), 3),
+           " | max=", round(max(train_df[[removed]], na.rm=TRUE), 3))
+  } else {
+    NA_character_
+  }
+  
+# Retourne un résumé structuré de l'étape
+  tibble(
+    step = step_id,                                # Numéro de l'étape
+    removed = removed,                             # Variable retirée à cette étape
+    removed_value = removed_value,                 # Statistiques de la variable retirée
+    worst_p_var = worst_var,                       # Variable la moins significative restante
+    worst_p_value = worst_p,                       # Sa p-value
+    n_vars = length(coef(m)) - 1,                  # Nombre de variables restantes (hors intercept)
+    AIC = AIC(m),                                  # Critère AIC du modèle
+    BIC = BIC(m),                                  # Critère BIC du modèle
+    pseudoR2_mcfadden = pseudoR2_mcfadden(m),      # Pseudo R²
+    formula = deparse(formula(m))                  # Formule du modèle à cette étape
+
+  )
+}
+
+```
+
+
+```{r MODÈLE 1 — RÉGRESSION LOGISTIQUE}
+# Phase A: entraînement + selection sur TRAIN
+# Construction du modèle complet (toutes les variables)
+full_formula <- as.formula(paste(y_col, "~", paste(x_cols, collapse = " + ")))
+m_current <- glm(full_formula, data = train_df, family = binomial())
+
+# Initialisation de l’historique (étape 0 = modèle complet)
+history <- model_snapshot(m_current, step_id = 0, removed = "NONE", train_df = train_df)
+
+step_id <- 0
+
+# Seuil de significativité pour le backward (alpha = 5 %)
+alpha <- 0.05
+alpha <- as.numeric(alpha)[1]
+stopifnot(is.numeric(alpha), length(alpha) == 1, is.finite(alpha))
+
+# Boucle du backward stepwise :
+# À chaque itération, on retire la variable la moins significativ
+repeat {
+  pvals <- get_pvalues(m_current)                                      # Récupère les p-values des variables restantes
+  if (length(pvals) == 0) break                                        # Si plus aucune variable, on arrête
+
+  worst_var <- names(which.max(pvals))                                 # Variable avec la plus grande p-value
+  worst_p   <- suppressWarnings(max(pvals, na.rm = TRUE))
+  worst_p   <- as.numeric(worst_p)[1]
+
+# Affichage console pour suivre le processus
+cat("worst_var =", worst_var, "| worst_p =", worst_p, "| alpha =", alpha, "\n")
+
+# Si la variable la moins significative est en dessous du seuil → on arrête
+if (!is.finite(worst_p) || is.na(worst_p) || worst_p <= alpha) break
+
+# Mise à jour de la formule : suppression de la variable
+new_formula <- update(formula(m_current), paste(". ~ . -", worst_var))
+m_new <- glm(new_formula, data = train_df, family = binomial())
+
+# Mise à jour de l’historique
+step_id <- step_id + 1
+history <- bind_rows(history, model_snapshot(m_new, step_id, removed = worst_var, train_df = train_df))
+
+# Le nouveau modèle devient le modèle courant
+m_current <- m_new
+}
+
+# Modèle final après le backward
+final_model <- m_current
+
+final_model_no_intercept <- glm(
+  update(formula(final_model), . ~ . - 1),
+  data = train_df,
+  family = binomial()
+)
+
+AIC(final_model_no_intercept); BIC(final_model_no_intercept)
+#AIC(final_model); BIC(final_model)
+
+# Tableau récapitulatif des étapes
+history %>%
+  select(step, removed, removed_value, worst_p_var, worst_p_value, n_vars, AIC, BIC, pseudoR2_mcfadden, formula)
+
+# Résumé du modèle final
+#summary(final_model)
+summary(final_model_no_intercept)
+
+```
+
+## Interpretation
+- Itération 0 (modèle complet) : worst_var = diagonal avec worst_p = 0.7512566 (> 0.05) ⇒ diagonal n’apporte pas d’information statistiquement utile dans le modèle complet → on la retire.
+
+- Itération 1 (après retrait de diagonal) : worst_var = height_left avec worst_p = 0.3879029 (> 0.05) ⇒ height_left n’est pas significative non plus → on la retire.
+
+- Itération 2 (après retrait de height_left) : worst_var = height_right avec worst_p = 0.01082285 (≤ 0.05) ⇒ maintenant la p-value restante est déjà significative → arrêt de l’algorithme (toutes les variables restantes sont ≤ 0.05).
+
+Les variables retirées sont : diagonal, puis height_left.Les variables conservées dans le modèle final : height_right, margin_low, margin_up, length.
+
+Toutes les variables affichées ont des p-values très petites, donc fortement significatives => Statistiquement, chacune contribue à expliquer la probabilité de la classe cible, une fois les autres variables prises en compte.
+
+Les indicateurs globaux (deviance très faible, AIC/BIC en baisse, pseudo-R² très élevé) confirment un modèle très performant et stable.
+
+```{r MODÈLE 1 — RÉGRESSION LOGISTIQUE}
+# Phase B: test sur TEST
+
+# Prédiction des probabilités de la classe "FAUX" sur le jeu de test
+proba_faux <- predict(final_model_no_intercept, newdata = test_df, type = "response")
+
+# Conversion des probabilités en classes (seuil = 0.5)
+threshold <- 0.5
+pred_class <- ifelse(proba_faux >= threshold, "FAUX", "VRAI") %>%
+  factor(levels = c("VRAI","FAUX"))
+
+# Classes réelles du test
+y_true <- factor(test_df[[y_col]], levels = c("VRAI","FAUX"))
+
+# Matrice de confusion + métriques centrées sur la classe "FAUX"
+cm <- confusionMatrix(pred_class, y_true, positive = "FAUX")
+cm$table
+cm$overall["Accuracy"]
+cm$byClass[c("Precision","Recall","F1")]
+
+# Évaluation personnalisée
+logreg_eval <- eval_model(test_df[[y_col]], pred_class, positive_class = "FAUX")
+
+# Calcul de l’AUC (aire sous la courbe ROC)
+logreg_auc  <- eval_auc(test_df[[y_col]], proba_faux)
+
+```
+## Interpretations
+- VRAI prédits VRAI : 192 (bons “VRAI”).
+- VRAI prédits FAUX : 0.
+- FAUX prédits VRAI : 2 (2 erreurs : FAUX alors que c’était VRAI).
+- FAUX prédits FAUX : 98 (bons “FAUX”).
+Donc, sur 292 billets test (192+0+2+98 = 292), tu as 2 erreurs au total.
+
+Accuracy = 0.9931507 -> 99,32% des billets sont bien classés.
+Precision = 0.98 -> Parmi les billets prédits FAUX, 2 faux positifs : 2 VRAI annoncés FAUX.
+Recall = 1.00 -> Parmi les billets vraiment FAUX, aucun FAUX classé VRAI.
+F1 = 0.989899 ➜ Très bon compromis
+Globalement : le système est très performant, plutôt “strict” (Préfère signaler FAUX plutôt que laisser passer un FAUX).
+
+```{r MODÈLE 2 — KNN}
+# Phase A: entraînement + optimisation de k (CV) sur TRAIN (standardisation)
+# Construction d'une grille de valeurs pour k
+grid_knn <- expand.grid(k = seq(3, 31, by = 2))
+
+# Entraînement du modèle KNN avec caret
+knn_fit <- train(
+  x = train_df[, x_cols],                      # Variables explicatives
+  y = train_df[[y_col]],                       # Variable cible
+  method = "knn",                              # Algorithme KNN
+  preProcess = c("center","scale"),            # Normalisation des données
+  tuneGrid = grid_knn,                         # Grille des valeurs de k à tester
+  trControl = ctrl,                            # Méthode de validation croisée
+  metric = "Accuracy"                          # Critère d'optimisation
+)
+
+# Affichage du modèle entraîné (résultats complets)
+knn_fit
+
+# Meilleure valeur de k trouvée par caret
+knn_fit$bestTune
+
+# Courbe Accuracy vs k
+plot(knn_fit)
+
+# Extraction du meilleur k
+best_k <- knn_fit$bestTune$k
+best_k
+
+```
+## Interpretation
+- k trop petit → modèle trop “sensible” (variance élevée, sur-apprentissage).
+- k trop grand → modèle trop « lissé » (biais, sous-apprentissage) d'où le constat la performance varie selon k. Il y une zone optimale autour de ~9 à ~15 (le meilleur est 13). Quand k devient grand (vers 25–31), l’accuracy a tendance à stagner ou baisser. Le graphique confirmer que k=13 est un bon compromis/variance biais. 
+
+```{r MODÈLE 2 — KNN (SUITE)}
+# Phase B: test sur TEST
+# Prédictions des classes sur le jeu de test
+knn_pred_test <- predict(knn_fit, newdata = test_df[, x_cols])
+
+# Prédiction des probabilités de la classe "FAUX"
+knn_prob_test <- predict(knn_fit, newdata = test_df[, x_cols], type = "prob")[, "FAUX"]
+
+# Évaluation complète du modèle
+knn_eval_test <- eval_model(test_df[[y_col]], knn_pred_test, positive = "FAUX")
+
+knn_eval_test$confusion                  # Matrice de confusion
+knn_eval_test                            # Toutes les métriques calculées
+
+# Calcul de l'AUC 
+knn_auc  <- eval_auc(test_df[[y_col]], knn_prob_test)
+knn_auc
+
+```
+
+
+
+## Interpretation e la matrice de confusion
+Matrice affichée :  
+- VRAI : 193 correctement prédits VRAI, 0 faux billets ratés dans cette ligne.  
+- FAUX : 98 correctement prédits FAUX, 1 billet VRAI prédit FAUX (donc une fausse alerte).
+
+En termes standards :  
+- TP (FAUX détectés comme FAUX) = 98  
+- FN (FAUX détectés comme VRAI) = 0  (aucun faux billet manqué)  
+- FP (VRAI détectés comme FAUX) = 1 (une fausse alerte)  
+- TN (VRAI détectés comme VRAI) = 193 
+
+- Accuracy = 0.9965753 ≈ 99,66% de prédictions correctes sur l’échantillon TEST (291/292 correctes). 
+- Precision_FAUX = 0.989899 : Parmi les billets prédits FAUX, environ 99% sont réellement FAUX.
+- Recall_FAUX = 1 :  Parmi les billets réellement FAUX, 100% sont détectés.
+- F1_FAUX = 0.9949239 :  Excellent compromis précision/rappel.
+Donc  KNN (k=13) est extrêmement performant sur TEST, surtout sur l’objectif clé : ne pas laisser passer de faux billets. 
+
+```{r MODÈLE 3 — RANDOM FOREST}
+# Phase A: entraînement + optimisation mtry (CV) sur TRAIN
+ntree <- 500                                        # Nombre d'arbres dans la forêt
+mtry_grid <- 1:length(x_cols)                       # Grille des valeurs possibles pour mtry (1 variable jusqu'à toutes les variables)
+
+# Boucle d'optimisation : on teste chaque mtry et on mesure
+# l'erreur OOB (Out-Of-Bag) pour choisir le meilleur.
+oob_res <- purrr::map_df(mtry_grid, function(m) {
+  set.seed(100 + m)                                 # Reproductibilité pour chaque mtry
+
+# Entraînement d'un Random Forest avec un mtry donné
+fit_tmp <- randomForest(
+    x = train_df[, x_cols],                         # Variables explicatives
+    y = train_df[[y_col]],                          # Variable cible
+    ntree = ntree,                                  # Nombre d'arbres
+    mtry  = m,                                      # Nombre de variables testées à chaque split
+    importance = TRUE                               # Importance des variables
+  )
+
+# Erreur OOB finale (ligne correspondant au dernier arbre)
+oob_err <- fit_tmp$err.rate[nrow(fit_tmp$err.rate), "OOB"]
+
+# Résultats stockés dans un tibble
+  tibble(
+    mtry = m,
+    oob_error = oob_err,
+    oob_accuracy = 1 - oob_err
+  )
+}) %>% arrange(desc(oob_accuracy))                # Classement du meilleur au moins bon
+
+# Affichage des résultats OOB
+oob_res
+
+# Extraction du meilleur mtry (celui avec la meilleure accuracy OOB)
+best_mtry <- oob_res$mtry[1]
+best_mtry
+
+# Entraînement du modèle final Random Forest avec le meilleur mtry trouvé
+set.seed(42)
+rf_fit <- randomForest(
+  x = train_df[, x_cols],
+  y = train_df[[y_col]],
+  ntree = ntree,
+  mtry  = best_mtry,
+  importance = TRUE
+)
+
+rf_fit  # Résumé du modèle + estimation OOB
+
+# Courbe d'erreur OOB au fil des arbres (diagnostic)
+plot(rf_fit$err.rate[, "OOB"], type = "l",
+     main = paste0("Erreur OOB vs #arbres (mtry=", best_mtry, ")"),
+     xlab = "Nombre d'arbres", ylab = "Erreur OOB")
+
+# Importance des variables (MeanDecreaseAccuracy)
+# Mesure la perte d'accuracy lorsque la variable est permutée.
+imp <- importance(rf_fit, type = 1)  
+
+# Mise en forme dans un tibble pour tri et affichage
+imp_df <- tibble(variable = rownames(imp), importance = imp[,1]) %>%
+  arrange(desc(importance))
+
+# Tableau trié des variables les plus importantes
+imp_df
+
+# Visualisation de l'importance des variables
+barplot(imp_df$importance, names.arg = imp_df$variable,
+        las = 2, main = "Importance des variables (Random Forest)",
+        ylab = "MeanDecreaseAccuracy")
+
+```
+## Interprétations
+- Le meilleur mtry = 1 (OOB accuracy ≈ 0,9898, OOB error ≈ 0,01025). ->  l'optimisation du paramètre mtry sur TRAIN a été fait, via l’estimation OOB, et le meilleur choix est mtry = 1. 
+
+- L’erreur globale OOB est ~1,02%, donc performance déjà très forte sur l’évaluation interne TRAIN (OOB). 
+
+-  VRAI : 775 bien classés, 2 VRAI pris pour FAUX → erreur VRAI ≈ 0,26% et FAUX : 384 bien classés, 10 FAUX pris pour VRAI → erreur FAUX ≈ 2,54%. Le modèle est excellent globalement, mais il fait un peu plus d’erreurs sur la classe FAUX que sur VRAI. 
+
+- Au début, l’erreur baisse très vite quand on ajoute des arbres : c’est normal, la forêt se stabilise.  Puis la courbe devient quasi plate autour de ~0,01. Donc  À partir d’un certain nombre d’arbres (~100–200), ajouter des arbres n’apporte presque plus de gain. Avec 500 arbres, on est dans une zone stable et robuste (variance réduite). Donc le choix ntree=500 est cohérent  alors on a réduit la variance et stabilisé le modèle. 
+
+- length + margins portent l’essentiel du pouvoir discriminant pour séparer VRAI/FAUX.  diagonal apporte très peu d’information supplémentaire dans la forêt 
+
+
+```{r MODÈLE 3 — RANDOM FOREST}
+# Phase B : Évaluation sur le jeu de TEST
+# Prédictions des classes sur le jeu de test
+rf_pred_test <- predict(rf_fit, newdata = test_df[, x_cols], type = "class")
+
+# Évaluation complète : matrice de confusion + accuracy + precision + recall + F1
+rf_eval_test <- eval_model(test_df[[y_col]], rf_pred_test, positive_class = "FAUX")
+rf_eval_test$confusion            # Matrice de confusion
+rf_eval_test                      # Toutes les métriques calculées
+
+# Probabilités de la classe "FAUX" pour ROC / AUC
+rf_prob_test <- predict(rf_fit, newdata = test_df[, x_cols], type = "prob")[, "FAUX"]
+
+# Calcul de l'AUC
+rf_auc  <- eval_auc(test_df[[y_col]], rf_prob_test)
+rf_auc
+
+# Scores sur TRAIN pour détecter un éventuel surapprentissage
+rf_pred_train <- predict(rf_fit, newdata = train_df[, x_cols], type = "class")
+rf_eval_train <- eval_model(train_df[[y_col]], rf_pred_train, positive_class = "FAUX")
+
+# Tableau comparatif TRAIN vs TEST
+rf_scores <- tibble(
+  set = c("TRAIN", "TEST"),
+  accuracy = c(rf_eval_train$accuracy, rf_eval_test$accuracy),
+  precision_faux = c(rf_eval_train$precision_faux, rf_eval_test$precision_faux),
+  recall_faux = c(rf_eval_train$recall_faux, rf_eval_test$recall_faux),
+  f1_faux = c(rf_eval_train$f1_faux, rf_eval_test$f1_faux)
+)
+rf_scores   # Tableau final des performances
+
+```
+
+## Interprétation :
+Matrice de confusion (TEST) :  
+- VRAI prédit VRAI : 193 (bons VRAI) 
+- VRAI prédit FAUX : 0 (aucun VRAI accusé à tort) 
+- FAUX prédit VRAI : 1 (1 faux billet “laissé passer”) 
+- FAUX prédit FAUX : 98 (faux billets bien détectés). 
+Donc, sur TEST (total = 193 + 0 + 1 + 98 = 292 billets) : 1 seule erreur, et c’est l’erreur la plus “risquée” : un FAUX classé VRAI.
+
+- Accuracy = 0,9965753 ( 291 / 292 billets correctement classés.).  Très bon, mais en détection de faux billets 
+- Precision_FAUX = 0,989899 ->  aucun billet VRAI traité comme FAUX
+- Recall_FAUX = 1 ->  Tous les faux billets sont détectés.
+- F1_FAUX = 0,9949239 ->  excellent : le modèle est très bon pour identifier FAUX.
+- AUC = 0,9997896 ->  ≈ 1 signifie séparation quasi parfaite.
+Sur la base TEST, le modèle est quasi parfait (accuracy ~99,7%, AUC ~1) et détecte extrêmement bien les faux billets, avec au plus 1 erreur selon la matrice. 
+
+```{r MODÈLE 4 — K-MEANS }
+# Phase A: TRAIN (choisir K + entraîner)
+# Matrice X TRAIN standardisée (centrer-réduire)
+X_train <- as.matrix(train_df[, x_cols])
+X_train_scaled <- scale(X_train)
+
+# Choix de K (sur TRAIN uniquement)
+fviz_nbclust(X_train_scaled, kmeans, method = "wss")
+fviz_nbclust(X_train_scaled, kmeans, method = "silhouette")
+
+K <- 2  # (exemple : selon WSS/silhouette)
+km_fit <- kmeans(X_train_scaled, centers = K, nstart = 25)
+
+# Mapping cluster -> classe via majorité sur TRAIN
+tab_train <- table(cluster = km_fit$cluster, y = train_df[[y_col]])
+cluster_to_class <- apply(tab_train, 1, function(row) names(row)[which.max(row)])
+
+```
+## Interpretation
+- WSS / inertie intra = dispersion à l’intérieur des clusters (plus c’est bas, plus les clusters sont “compacts”). La courbe baisse très fortement de k=1 à k=2, puis la baisse devient beaucoup plus faible après. Donc, le “coude” est autour de k = 2 : ajouter plus de clusters améliore encore un peu, mais le gain marginal est limité. d'où k=2 est un bon choix simple (cohérent avec 2 groupes attendus : VRAI vs FAUX).
+
+- La silhouette moyenne est maximale à k = 2 (le point le plus haut, avec la ligne verticale). Ensuite, pour k ≥ 3, elle diminue → les clusters deviennent moins nets (sur-segmentation).Donc  k=2 est aussi le meilleur selon ce critère.
+
+```{r MODÈLE 4 — K-MEANS}
+# Phase B: TEST  (assigner + mapper vers VRAI/FAUX + évaluer)
+# Standardiser TEST avec les paramètres TRAIN (important!)
+train_means <- attr(X_train_scaled, "scaled:center")
+train_sds   <- attr(X_train_scaled, "scaled:scale")
+
+X_test <- as.matrix(test_df[, x_cols])
+X_test_scaled <- sweep(sweep(X_test, 2, train_means, "-"), 2, train_sds, "/")
+
+# Affecter chaque point TEST au centroïde le plus proche
+assign_cluster <- function(X, centers) {
+  apply(X, 1, function(row) {
+    d <- apply(centers, 1, function(cntr) sum((row - cntr)^2))
+    which.min(d)
+  })
+}
+
+test_clusters <- assign_cluster(X_test_scaled, km_fit$centers)
+
+# Convertir cluster -> classe prédite
+km_pred_test <- factor(cluster_to_class[as.character(test_clusters)],
+                       levels = c("VRAI","FAUX"))
+
+# Évaluer sur TEST
+cm_km <- confusionMatrix(km_pred_test, test_df[[y_col]], positive = "FAUX")
+cm_km$table
+cm_km$overall["Accuracy"]
+cm_km$byClass[c("Precision","Recall","F1")]
+
+
+km_eval <- eval_model(test_df[[y_col]], km_pred_test, positive_class = "FAUX")
+
+```
+## Interpretation 
+- VRAI correctement prédits : 193 
+- FAUX correctement prédits : 97 
+Erreurs :  1 FAUX prédit VRAI (c’est un faux négatif côté “FAUX”) et  1 VRAI prédit FAUX (c’est un faux positif côté “FAUX”)
+
+- Accuracy = 0.993 : ~99,3% des billets du test sont bien classés. 
+- Précision (FAUX) = 0.9898 : quand le modèle dit “FAUX”, il a raison ~99% du temps (très peu de fausses alertes). 
+- Recall (FAUX) = 0.9898 : parmi les vrais faux billets, il en détecte ~99% (il en “rate” très peu). 
+- F1 (FAUX) = 0.9898 : excellent compromis précision/rappel sur la classe FAUX. 
+Donc  K-means à k=2 retrouve très bien la structure VRAI/FAUX sur vos données, après mapping. 
+
+
+```{r Tableau comparatif des performances des modèles sur TEST}
+# ---------------------------------------------------------
+# On regroupe ici les métriques essentielles pour comparer :
+# - Régression Logistique
+# - KNN
+# - Random Forest
+# - K-means (indicatif, non supervisé)
+#
+# Les métriques utilisées :
+#   accuracy       : proportion de bonnes prédictions
+#   precision_faux : précision pour la classe "FAUX"
+#   recall_faux    : rappel pour la classe "FAUX"
+#   f1_faux        : score F1 pour la classe "FAUX"
+#   auc            : aire sous la courbe ROC (sauf kmeans)
+# ---------------------------------------------------------
+
+results_test <- tibble(
+  modele = c("LogReg", "KNN", "RandomForest", "Kmeans(indicatif)"),
+  accuracy = c(logreg_eval$accuracy, knn_eval_test$accuracy, rf_eval_test$accuracy, km_eval$accuracy),
+  precision_faux = c(logreg_eval$precision_faux, knn_eval_test$precision_faux, rf_eval_test$precision_faux, km_eval$precision_faux),
+  recall_faux = c(logreg_eval$recall_faux, knn_eval_test$recall_faux, rf_eval_test$recall_faux, km_eval$recall_faux),
+  f1_faux = c(logreg_eval$f1_faux, knn_eval_test$f1_faux, rf_eval_test$f1_faux, km_eval$f1_faux),
+  auc = c(logreg_auc$auc, knn_auc$auc, rf_auc$auc, NA_real_)       # Pas d'AUC pour kmeans (non supervisé)
+) %>%
+  
+  # Tri des modèles selon les critères les plus importants
+  arrange(desc(recall_faux), desc(f1_faux), desc(auc))
+
+# Affichage du tableau final
+results_test  
+```
+
+```{r PARTIE 3 : # Sélection du meilleur modèle selon les métriques TEST}
+# ---------------------------------------------------------
+# On trie les modèles selon :
+#   1) le recall sur la classe FAUX (priorité)
+#   2) le F1-score sur FAUX
+#   3) l'AUC
+# Puis on récupère le nom du modèle le mieux classé.
+# ---------------------------------------------------------
+
+best_model_name <- results_test %>%
+  arrange(desc(recall_faux), desc(f1_faux), desc(auc)) %>%
+  slice(1) %>%                                               # On prend le meilleur modèle
+  pull(modele)                                               # Extraction du nom du modèle
+
+# Affichage du modèle sélectionné
+best_model_name
+
+# Association du nom du modèle à l'objet R correspondant
+best_model <- switch(                 # switch() permet de choisir dynamiquement l'objet modèle en fonction du nom sélectionné ci-dessus
+  best_model_name,
+  "LogReg" = final_model,             # Modèle de régression logistique
+  "KNN" = knn_fit,                    # Modèle KNN
+  "RandomForest" = rf_fit,            # Modèle Random Forest
+  "Kmeans(indicatif)" = km_fit        # Modèle k-means (indicatif)
+)
+
+
+```
+
+```{r Test de la solution}
+# Construction du pipeline final
+# ---------------------------------------------------------
+# Ce pipeline regroupe :
+#   - le nom du meilleur modèle sélectionné
+#   - l'objet modèle lui-même
+#   - les variables explicatives utilisées
+#   - la variable cible
+#   - la date/heure de création
+#
+# Si le meilleur modèle est K-means (cas indicatif),
+# on ajoute aussi :
+#   - les centres des clusters
+#   - la correspondance cluster → classe
+#   - les paramètres de centrage/réduction du TRAIN
+# ---------------------------------------------------------
+
+final_pipeline <- list(
+  model_name = best_model_name,            # Nom du modèle retenu
+  model = best_model,                      # Objet modèle (LogReg, KNN, RF ou Kmeans)
+  features = x_cols,                       # Variables explicatives
+  target = y_col,                          # Variable cible
+  created_at = Sys.time(),                 # Horodatage du pipeline
+
+  # Éléments spécifiques au modèle K-means (sinon NULL)
+  km_centers = if (best_model_name == "Kmeans(indicatif)") km_fit$centers else NULL,
+  cluster_to_class = if (best_model_name == "Kmeans(indicatif)") cluster_to_class else NULL,
+  train_center = if (best_model_name == "Kmeans(indicatif)") train_means else NULL,
+  train_scale  = if (best_model_name == "Kmeans(indicatif)") train_sds else NULL
+)
+
+# Test de la solution sur TEST (rejouer la prédiction du modèle choisi) ----
+if (final_pipeline$model_name == "LogReg") {
+  p <- predict(final_pipeline$model, newdata = test_df, type = "response")
+  pred <- factor(ifelse(p >= 0.5, "FAUX", "VRAI"), levels = c("VRAI","FAUX"))
+  final_eval <- eval_model(test_df[[y_col]], pred, positive_class = "FAUX")
+  final_auc  <- eval_auc(test_df[[y_col]], p)
+
+} else if (final_pipeline$model_name == "KNN") {
+  pred <- predict(final_pipeline$model, newdata = test_df[, x_cols])
+  p <- predict(final_pipeline$model, newdata = test_df[, x_cols], type = "prob")[, "FAUX"]
+  final_eval <- eval_model(test_df[[y_col]], pred, positive_class = "FAUX")
+  final_auc  <- eval_auc(test_df[[y_col]], p)
+
+} else if (final_pipeline$model_name == "RandomForest") {
+  pred <- predict(final_pipeline$model, newdata = test_df[, x_cols], type = "class")
+  p <- predict(final_pipeline$model, newdata = test_df[, x_cols], type = "prob")[, "FAUX"]
+  final_eval <- eval_model(test_df[[y_col]], pred, positive_class = "FAUX")
+  final_auc  <- eval_auc(test_df[[y_col]], p)
+
+} else if (final_pipeline$model_name == "Kmeans(indicatif)") {
+  X_test <- as.matrix(test_df[, x_cols])
+  X_test_scaled <- sweep(sweep(X_test, 2, final_pipeline$train_center, "-"), 2, final_pipeline$train_scale, "/")
+  cl <- assign_cluster(X_test_scaled, final_pipeline$km_centers)
+  pred <- factor(final_pipeline$cluster_to_class[as.character(cl)], levels = c("VRAI","FAUX"))
+  final_eval <- eval_model(test_df[[y_col]], pred, positive_class = "FAUX")
+  final_auc <- list(auc = NA_real_, roc = NULL)
+}
+
+final_eval
+final_auc$auc
+
+# Sauvegarde du pipeline
+dir.create("models", showWarnings = FALSE)
+saveRDS(final_pipeline, file = "models/final_pipeline.rds")
+
+# Rechargement
+pipeline_loaded <- readRDS("models/final_pipeline.rds")
+pipeline_loaded$model_name
+```
+
+
+
