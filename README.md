@@ -1,6 +1,11 @@
 # Détection de faux billets (R/Python — ML)
+**FR | EN**
+- 🇫🇷 [Français](#français)
+- 🇬🇧 [English](#english)
 
-[🇬🇧 English version](README_EN.md)
+---
+
+## Français
 
 ## Contexte
 L’objectif est de mettre en place un modèle de **classification** capable de distinguer des billets **authentiques** et **contrefaits** à partir de caractéristiques mesurées (variables numériques).
@@ -63,8 +68,7 @@ Bruno Brovou — Data Analyst confirmé
 Email : j.b.brovou@gmail.com  
 Portfolio : https://brovou.github.io
 
-# Counterfeit banknote detection (R/Python — ML)
-[🇫🇷 Version française](README.md)
+## English
 
 ## Context
 The goal is to build a **classification model** to distinguish **genuine** vs **counterfeit** banknotes using measured numeric features (tabular data).
